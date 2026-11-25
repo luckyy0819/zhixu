@@ -1,0 +1,24 @@
+const {test}=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path');
+const {JSDOM}=require('jsdom');
+const root=path.resolve(__dirname,'../..');
+test('document controls preserve selection, exact Unicode highlights, deletion capability and epoch boundary',async()=>{
+ const dom=new JSDOM(fs.readFileSync(path.join(root,'index.html'),'utf8'),{url:'http://127.0.0.1:8788',runScripts:'outside-only'}),w=dom.window,d=w.document;
+ w.confirm=()=>true;let resolvePreview,requests=[],deleted=false,filesAvailable=true;
+ const state={epoch:1,user:{id:'a'},current:{id:'conv'}};
+ const file={id:'fid',conversation_id:'conv',name:'合成预算.txt',enabled:true,enabled_revision:1,status:'ready',version:1,job:{status:'completed'}};
+ const api=async(url,options={})=>{requests.push({url,...options});if(url.includes('preview'))return new Promise(r=>resolvePreview=r);if(url==='/account/data'){assert.match(options.body.receipt_token,/^[A-Za-z0-9_-]{43}$/);assert.equal(w.sessionStorage.length,1);return {status:'pending'};}if(url.startsWith('/deletions/'))return {status:'completed'};if(url==='/files/fid'){filesAvailable=false;return {status:'pending'};}if(url.endsWith('/files'))return options.method==='POST'?{file}:{items:filesAvailable?[file]:[]};return file;};
+ w.eval(fs.readFileSync(path.join(root,'document-ui.js'),'utf8')+'\n//# sourceURL='+path.join(root,'document-ui.js').replaceAll('\\','/'));
+ const el=(tag,cls,text)=>{const n=d.createElement(tag);if(cls)n.className=cls;if(text!==undefined)n.textContent=text;return n;};
+ const ui=w.ZhixuDocuments({state,api,assertEpoch:e=>{if(e!==state.epoch)throw Object.assign(new Error('stale'),{stale:true});},el,note:()=>{},report:()=>{},ensureConversation:async()=>state.current,loadMessages:async()=>{},loadHistory:async()=>{},setView:()=>{},accountDeleted:()=>{deleted=true;ui.reset();}});
+ ui.opened([file]);assert.equal(ui.body().file_refs.length,1);
+ const check=d.querySelector('.document-select input');check.checked=false;check.onchange();await ui.reload();assert.throws(()=>ui.body(),/至少一份/);
+ check.checked=true;check.onchange();ui.opened([file]);
+ const answer=el('div');assert(ui.claims({claims:[{claim_index:0,kind:'fact',text:'预算7600'}],citations:[{id:'cite',claim_index:0,source_status:'active',version:1,page:2}]},answer));
+ answer.querySelector('button').click();await Promise.resolve();resolvePreview({name:file.name,file_id:file.id,version:1,page:2,paragraph:1,parser_revision:'test',text:'甲😀预算7600',text_start:0,highlight:{start:1,end:2}});await new Promise(r=>setImmediate(r));assert.equal(d.querySelector('mark').textContent,'😀');
+ answer.querySelector('button').click();await Promise.resolve();state.epoch++;ui.reset();resolvePreview({name:'OLD A',text:'OLD A'});await new Promise(r=>setImmediate(r));assert.equal(d.getElementById('preview-title').textContent,'');
+ await ui.addFiles([new w.File(['合成'],'unit.txt',{type:'text/plain'})]);
+ const remove=[...d.querySelectorAll('.doc-buttons button')].find(b=>b.textContent==='删除资料');remove.click();await new Promise(r=>setImmediate(r));assert(d.querySelector('.empty-docs'),'completed upload must not hide empty state after deleting its file');
+ d.getElementById('delete-current-password').value='synthetic-pass-123';d.getElementById('delete-confirmation').value='DELETE';await d.getElementById('delete-account-form').onsubmit({preventDefault(){}});assert(deleted);assert.equal(d.getElementById('delete-current-password').value,'');assert.match(d.getElementById('deletion-status').textContent,/pending/);
+ d.getElementById('deletion-query').click();await new Promise(r=>setImmediate(r));assert.equal(w.sessionStorage.length,0);assert.match(d.getElementById('deletion-status').textContent,/completed/);
+ dom.window.close();
+});

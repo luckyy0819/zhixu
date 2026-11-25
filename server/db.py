@@ -57,6 +57,8 @@ CREATE TABLE IF NOT EXISTS idempotency_keys(owner_id TEXT NOT NULL REFERENCES us
  payload_hash TEXT NOT NULL,resource_type TEXT NOT NULL,resource_id TEXT NOT NULL,created_at TEXT NOT NULL,expires_at REAL NOT NULL,PRIMARY KEY(owner_id,route,key));
 ''')
         self.conn.execute('INSERT OR IGNORE INTO schema_migrations VALUES(1,?)',(now(),))
+        from .document_schema import migrate
+        migrate(self)
 
     def one(self, sql, args=()):
         row = self.conn.execute(sql,args).fetchone()

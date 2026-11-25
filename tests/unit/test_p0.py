@@ -10,7 +10,7 @@ def test_health_security_and_persistence(tmp_path, monkeypatch):
     cfg = Settings(data_dir=tmp_path, model_base_url='http://127.0.0.1:1/v1', model_name='test')
     with TestClient(create_app(cfg), base_url=cfg.origin) as c:
         assert c.get('/api/v1/health').json()['data']['status'] == 'ok'
-        assert c.get('/api/v1/health').headers['x-zhixu-version']=='0.1.0-p0.2'
+        assert c.get('/api/v1/health').headers['x-zhixu-version']=='0.1.0-document.6'
         runtime_audit=(tmp_path/'runtime-audit.jsonl').read_text(encoding='utf-8')
         assert 'ZHIXU-TASK-005' in runtime_audit and 'password' not in runtime_audit
         assert c.get('/api/v1/conversations').status_code == 401

@@ -1,5 +1,6 @@
 """DES003 upstream SSE adapter. Only real content is yielded; stop AND DONE required."""
 import asyncio
+from contextlib import aclosing
 import json
 import httpx
 from .errors import DomainError
@@ -11,6 +12,7 @@ def model_error(code):
         'OUTPUT_LIMIT':(502,'回答达到输出上限，内容尚未完整',False),
         'UPSTREAM_INCOMPLETE':(502,'模型流未完整结束，请显式重试',True),
         'MODEL_FORMAT_ERROR':(502,'模型返回格式无效，请联系开发排查',False),
+        'CITATION_INVALID':(502,'模型引用不符合原文定位，未展示无效结论，请调整问题或联系开发排查',False),
         'MODEL_AUTH_ERROR':(502,'模型认证失败，请检查服务端配置',False),
         'MODEL_RATE_LIMIT':(429,'模型限流，请稍后显式重试',True),
         'MODEL_TIMEOUT':(504,'模型响应超时，请显式重试',True),
@@ -26,8 +28,9 @@ async def stream_model(cfg, messages, client=None):
     queue=asyncio.Queue(maxsize=4);holder={}
     async def produce():
         try:
-            async for content in decode_model(cfg,messages,client,holder):
-                await queue.put(('content',content))
+            async with aclosing(decode_model(cfg,messages,client,holder)) as source:
+                async for content in source:
+                    await queue.put(('content',content))
             await queue.put(('end',None))
         except Exception as error:
             await queue.put(('error',error))
@@ -53,7 +56,11 @@ async def decode_model(cfg, messages, client=None, holder=None):
         async with asyncio.timeout(cfg.total_timeout):
             headers={'Authorization':'Bearer '+cfg.api_key} if cfg.api_key else {}
             request=client.build_request('POST',cfg.model_base_url+'/chat/completions',headers=headers,json={
-                    'model':cfg.model_name,'stream':True,'messages':messages,'max_tokens':cfg.output_tokens,'temperature':0.2})
+                    'model':cfg.model_name,'stream':True,'messages':messages,'max_tokens':cfg.output_tokens,'temperature':0.2,
+                    # The configured Qwen endpoint supports this option (real
+                    # probe retained). The UI does not expose deep thinking;
+                    # reserve the frozen output budget for the actual answer.
+                    'chat_template_kwargs':{'enable_thinking':False}})
             r=await client.send(request,stream=True)
             if holder is not None:
                 holder['response']=r

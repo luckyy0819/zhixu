@@ -36,6 +36,15 @@ class Question(DTO):
     file_refs: list[dict] = Field(max_length=5)
     intent: Literal['question','summary']
 
+    @field_validator('file_refs')
+    @classmethod
+    def valid_refs(cls,refs):
+        for ref in refs:
+            if set(ref)!={'file_id','version'} or type(ref['version']) is not int or ref['version']<1 or not isinstance(ref['file_id'],str):
+                raise ValueError('invalid file ref')
+            UUID(ref['file_id'])
+        return refs
+
     @field_validator('content')
     @classmethod
     def not_blank(cls, value):
@@ -49,8 +58,38 @@ class Retry(DTO):
     scope_policy: Literal['current']
     confirmed_file_refs: list[dict] = Field(default_factory=list,max_length=5)
 
+    @field_validator('confirmed_file_refs')
+    @classmethod
+    def valid_refs(cls,refs):
+        return Question.valid_refs(refs)
+
     @field_validator('failed_request_id')
     @classmethod
     def valid_id(cls, value):
+        UUID(value)
+        return value
+
+
+class EnableFile(DTO):
+    enabled: bool
+    revision: int = Field(ge=1)
+
+
+class DeleteFile(DTO):
+    confirmation: Literal['DELETE']
+
+
+class DeleteConversation(DeleteFile):
+    include_files: Literal[True]
+
+
+class DeleteAccount(DeleteFile):
+    current_password: str = Field(min_length=12,max_length=128)
+    deletion_key: str
+    receipt_token: str = Field(pattern=r'^[A-Za-z0-9_-]{43,128}$')
+
+    @field_validator('deletion_key')
+    @classmethod
+    def valid_key(cls,value):
         UUID(value)
         return value

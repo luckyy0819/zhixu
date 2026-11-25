@@ -5,6 +5,7 @@ import time
 from uuid import UUID
 from .db import now, uid
 from .errors import DomainError
+from .idempotency import check_deleted,cleanup
 
 
 def valid_uuid(value):
@@ -34,6 +35,7 @@ def cursor_encode(row):
 class Conversations:
     def __init__(self, db):
         self.db=db
+        cleanup(db)
 
     def owned(self, cid, owner):
         valid_uuid(cid)
@@ -50,7 +52,8 @@ class Conversations:
         key=valid_uuid(request.headers.get('idempotency-key'))
         route=request.method+' '+request.url.path
         hashed=hashlib.sha256(json.dumps(body,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest()
-        self.db.run('DELETE FROM idempotency_keys WHERE expires_at<?',(time.time(),))
+        self.db.run('DELETE FROM idempotency_keys WHERE expires_at<=?',(time.time(),))
+        check_deleted(self.db,owner,route,key,hashed)
         row=self.db.one('SELECT * FROM idempotency_keys WHERE owner_id=? AND route=? AND key=?',(owner,route,key))
         if row and row['payload_hash']!=hashed:
             raise DomainError('IDEMPOTENCY_CONFLICT',409,'同一请求编号对应的内容已改变')
@@ -94,9 +97,9 @@ class Conversations:
             self.db.run("UPDATE conversations SET title=?,title_source='manual',revision=revision+1,updated_at=? WHERE id=? AND owner_id=?",(data.title.strip(),now(),cid,owner))
         return self.dto(self.owned(cid,owner))
 
-    @staticmethod
-    def message(row):
-        return {k:row[k] for k in ('id','conversation_id','role','content','status','parent_user_message_id','answer_version','model','created_at')} | {'claims':[],'citations':[]}
+    def message(self,row):
+        from .document_claims import claim_dtos,citation_dtos
+        return {k:row[k] for k in ('id','conversation_id','role','content','status','parent_user_message_id','answer_version','model','created_at')} | {'claims':claim_dtos(self.db,row['id']),'citations':citation_dtos(self.db,row['id'])}
 
     def messages(self, cid, owner, cursor, limit):
         self.owned(cid,owner)
