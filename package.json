@@ -1,0 +1,17 @@
+{
+  "name": "zhixu-local-p0",
+  "version": "0.1.0-p0.1",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/unit/*.test.cjs",
+    "check": "node --check app.js && node --check client-core.js"
+  },
+  "dependencies": {
+    "dompurify": "3.5.0",
+    "marked": "18.3.0"
+  },
+  "devDependencies": {
+    "jsdom": "31.0.1",
+    "v8-to-istanbul": "9.3.0"
+  }
+}
