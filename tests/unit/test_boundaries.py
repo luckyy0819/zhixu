@@ -61,7 +61,7 @@ def test_pagination_revision_search_and_question_validation(client):
     for body in [{'content':'  ','mode':'general','file_refs':[],'intent':'question'},{'content':'x','mode':'document','file_refs':[],'intent':'question'}]:
         h['Idempotency-Key']=str(uuid.uuid4());assert c.post('/api/v1/conversations/'+cid+'/messages',json=body,headers=h).status_code in (422,409)
     assert c.get('/api/v1/conversations/'+cid+'/messages').json()['data']['items']==[]
-    assert c.get('/api/v1/capabilities').json()['data']['features']['documents'] is False
+    assert c.get('/api/v1/capabilities').json()['data']['features']['documents'] is True
 
 
 @pytest.mark.parametrize('status,expected',[(401,'MODEL_AUTH_ERROR'),(403,'MODEL_AUTH_ERROR'),(429,'MODEL_RATE_LIMIT'),(503,'MODEL_UNAVAILABLE'),(400,'CONTEXT_LIMIT')])

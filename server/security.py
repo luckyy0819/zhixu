@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import datetime,timezone
 from starlette.responses import RedirectResponse
 from .errors import DomainError,error_response
@@ -49,6 +50,10 @@ class Security:
         if scope['method'] not in ('GET','HEAD','OPTIONS'):
             if headers.get('origin')!=self.cfg.origin:
                 await error_response(DomainError('ORIGIN_DENIED',403,'仅允许本地同源操作'))(scope,receive,secure_send);return
+            if scope['method']=='POST' and re.fullmatch(r'/api/v1/conversations/[0-9a-fA-F-]{36}/files',scope['path']):
+                # The authenticated upload route itself counts the raw stream and
+                # its lease. Never pre-buffer binary documents as JSON here.
+                await self.app(scope,receive,secure_send);return
             if not headers.get('content-type','').lower().startswith('application/json'):
                 await error_response(DomainError('VALIDATION_ERROR',422,'请使用JSON请求'))(scope,receive,secure_send);return
             body=bytearray()

@@ -19,7 +19,7 @@ def events(request, service, rid, owner):
     if after>row['last_seq']:
         raise DomainError('EVENT_CURSOR_AHEAD',422,'事件游标超前',details={'last_seq':row['last_seq']})
     expired=datetime.fromisoformat(row['created_at']) < datetime.now(timezone.utc)-timedelta(hours=24)
-    if (row['events_invalidated'] or expired) and after<row['last_seq']:
+    if row['events_invalidated'] or expired and after<row['last_seq']:
         raise DomainError('EVENT_HISTORY_EXPIRED',410,'事件已过期，请重新获取请求快照')
     async def generate():
         nonlocal after

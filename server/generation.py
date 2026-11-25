@@ -1,10 +1,13 @@
 import asyncio
+from contextlib import aclosing
 import json
 import logging
 from .db import now,uid
 from .errors import DomainError
 from .context import build_context
 from .model import stream_model,model_error
+from .document_claims import claim_stream,persist_claim,claim_dtos,citation_dtos
+from .retrieval import prepare_retrieval
 
 ACTIVE=('queued','running')
 
@@ -13,6 +16,7 @@ class Generations:
     def __init__(self, db, cfg, auth, conversations, gates):
         self.db,self.cfg,self.auth,self.convs,self.gates=db,cfg,auth,conversations,gates
         self.tasks={}
+        self.documents=None
 
     def owned(self, rid, owner):
         from .conversations import valid_uuid
@@ -28,7 +32,7 @@ class Generations:
         keys=('id','conversation_id','user_message_id','assistant_message_id','status','mode','intent','last_seq','created_at','updated_at')
         return {k:row[k] for k in keys} | {'events_invalidated':bool(row['events_invalidated']),'content':msg['content'],
              'scope':json.loads(row['scope_json']),'scope_exclusions':json.loads(row['scope_exclusions_json']),
-             'coverage':None,'claims':[],'citations':[],'error':model_error(row['error_code']).dto() if row['error_code'] else None}
+             'coverage':json.loads(row['coverage_json']) if row['coverage_json'] else None,'claims':claim_dtos(self.db,row['assistant_message_id']),'citations':citation_dtos(self.db,row['assistant_message_id']),'error':model_error(row['error_code']).dto() if row['error_code'] else None}
 
     def result(self, row):
         return dict(user_message_id=row['user_message_id'],assistant_message_id=row['assistant_message_id'],generation=self.dto(row),events_url='/api/v1/requests/'+row['id']+'/events')
@@ -40,8 +44,8 @@ class Generations:
             existing,key=self.convs.lookup_key(request,owner,body)
             if existing:
                 return self.result(self.owned(existing['resource_id'],owner))
-            if question.mode!='general' or question.file_refs:
-                raise DomainError('FILE_NOT_READY',409,'材料解析和检索尚未接通，本增量仅支持通用问答')
+            if question.mode=='general' and question.file_refs:
+                raise DomainError('VALIDATION_ERROR')
             if self.db.one("SELECT id FROM generation_requests WHERE conversation_id=? AND status IN ('queued','running')",(cid,)):
                 raise DomainError('GENERATION_ACTIVE',409,'当前会话仍在生成，请先等待或中止')
             if self.db.one("SELECT count(*) AS n FROM generation_requests WHERE status IN ('queued','running')")['n']>=2:
@@ -51,7 +55,30 @@ class Generations:
                 previous=self.owned(retry.failed_request_id,owner)
                 if previous['conversation_id']!=cid or previous['status'] not in ('failed','cancelled','interrupted'):
                     raise DomainError('REQUEST_NOT_RETRYABLE',409,'只能重试失败、中止或中断的回答')
-            messages,history,budget=build_context(self.db,self.cfg,cid,owner,question.content,previous['user_message_id'] if previous else None)
+                if question.mode=='document':
+                    original=json.loads(previous['scope_json']);available=[];unavailable=[]
+                    for ref in original:
+                        file=self.documents.owned(ref['file_id'],owner,True)
+                        reason='deleted' if file['deleted_at'] else 'disabled' if not file['enabled'] else 'not_ready' if file['status']!='ready' else None
+                        if reason:
+                            unavailable.append({'file_id':file['id'],'reason':reason})
+                        else:
+                            available.append({'file_id':file['id'],'version':file['version']})
+                    confirmed=retry.confirmed_file_refs
+                    if confirmed:
+                        if any(r['file_id'] not in {x['file_id'] for x in original} for r in confirmed):
+                            raise DomainError('VALIDATION_ERROR')
+                        question.file_refs=confirmed
+                    elif unavailable:
+                        raise DomainError('SCOPE_CHANGED',409,'资料范围已变更，请确认当前仍可用范围',details={'available_file_refs':available,'unavailable':unavailable})
+                    else:
+                        question.file_refs=available
+            messages,history,budget,exclusions,dependencies=build_context(self.db,self.cfg,cid,owner,question.content,previous['user_message_id'] if previous else None,True)
+            coverage=None;source_map={};scope=[]
+            if question.mode=='document':
+                messages,coverage,source_map,files,budget=prepare_retrieval(self.documents,self.cfg,owner,cid,question,messages)
+                scope=[{'file_id':f['id'],'version':f['version']} for f in files]
+                dependencies=sorted(set(dependencies)|{f['id'] for f in files})
             rid,aid,t=uid(),uid(),now()
             if previous:
                 user_id=previous['user_message_id']
@@ -63,7 +90,10 @@ class Generations:
             self.db.run('''INSERT INTO generation_requests(id,owner_id,conversation_id,user_message_id,assistant_message_id,status,mode,intent,model,
  history_ids_json,budget_json,snapshot_epoch,created_at,updated_at) VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?,?,?)''',
                 (rid,owner,cid,user_id,aid,question.mode,question.intent,self.cfg.model_name,json.dumps(history),json.dumps(budget),conv['access_epoch'],t,t))
-            self.db.event(rid,'meta',dict(request_id=rid,user_message_id=user_id,assistant_message_id=aid,answer_version=version,mode=question.mode,scope=[],scope_exclusions=[],coverage=None,budget=budget))
+            self.db.run('UPDATE generation_requests SET scope_json=?,scope_exclusions_json=?,coverage_json=?,source_token_map_json=?,dependency_file_ids_json=? WHERE id=?',
+                (json.dumps(scope),json.dumps(exclusions),json.dumps(coverage),json.dumps(source_map,ensure_ascii=False),json.dumps(dependencies),rid))
+            self.db.conn.executemany('INSERT INTO message_source_dependencies VALUES(?,?,?,?)',[(aid,fid,cid,owner) for fid in dependencies])
+            self.db.event(rid,'meta',dict(request_id=rid,user_message_id=user_id,assistant_message_id=aid,answer_version=version,mode=question.mode,scope=scope,scope_exclusions=exclusions,coverage=coverage,budget=budget,retrieval_no_match=question.mode=='document' and not source_map))
             self.convs.save_key(key,'generation',rid)
             if conv['title_source']=='default':
                 self.db.run("UPDATE conversations SET title=?,title_source='auto',revision=revision+1 WHERE id=? AND owner_id=?",(question.content[:24],cid,owner))
@@ -79,7 +109,7 @@ class Generations:
 
     def finish(self, rid, status, error=None):
         row=self.db.one('SELECT * FROM generation_requests WHERE id=?',(rid,))
-        if row['status'] not in ACTIVE:
+        if not row or row['status'] not in ACTIVE:
             return
         with self.db.transaction():
             self.db.run('UPDATE generation_requests SET status=?,error_code=?,cancel_requested=0,updated_at=? WHERE id=?',(status,error.code if error else None,now(),rid))
@@ -87,9 +117,36 @@ class Generations:
             if error:
                 self.db.event(rid,'error',error.dto()|{'status':status})
             elif status=='cancelled':
-                self.db.event(rid,'cancelled',{'status':status,'reason':'user'})
+                self.db.event(rid,'cancelled',{'status':status,'reason':'user' if self.dependencies_valid(row) else 'source_removed'})
             else:
-                self.db.event(rid,'done',{'status':'completed','finish_reason':'stop','coverage':None,'no_answer':False})
+                claims=claim_dtos(self.db,row['assistant_message_id'])
+                self.db.event(rid,'done',{'status':'completed','finish_reason':'stop','coverage':json.loads(row['coverage_json']) if row['coverage_json'] else None,'no_answer':bool(claims) and all(c['kind']=='no_answer' for c in claims)})
+
+    def dependencies_valid(self,row):
+        for fid in json.loads(row['dependency_file_ids_json']):
+            file=self.db.one('SELECT f.deleted_at,cf.enabled FROM files f JOIN conversation_files cf ON cf.file_id=f.id WHERE f.id=? AND f.owner_id=? AND f.conversation_id=?',(fid,row['owner_id'],row['conversation_id']))
+            if not file or file['deleted_at'] or not file['enabled']:
+                return False
+        return True
+
+    async def output(self,row,messages):
+        if row['mode']=='general':
+            async with aclosing(stream_model(self.cfg,messages)) as upstream:
+                async for text in upstream:
+                    yield text
+        elif not json.loads(row['source_token_map_json']):
+            yield ({'kind':'no_answer','text':'资料中未找到能够回答该问题的依据。'},[])
+            coverage=json.loads(row['coverage_json'])
+            for file in coverage['files']:
+                for warning in file['warnings']:
+                    if warning['code']=='PARTIAL_TEXT':
+                        pages='、'.join(str(p) for p in warning['pages'])
+                        yield ({'kind':'no_answer','text':'解析范围限制：第'+pages+'页无可提取文字，无法依据这些页面作答。'},[])
+        else:
+            async with aclosing(stream_model(self.cfg,messages)) as upstream:
+                async with aclosing(claim_stream(upstream,json.loads(row['source_token_map_json']))) as claims:
+                    async for item in claims:
+                        yield item
 
     async def run(self, rid, actor, messages):
         owner=actor['user_id']
@@ -101,14 +158,19 @@ class Generations:
                     self.db.run("UPDATE generation_requests SET status='running' WHERE id=?",(rid,))
                     self.db.run("UPDATE messages SET status='running' WHERE id=(SELECT assistant_message_id FROM generation_requests WHERE id=?)",(rid,))
                     self.db.event(rid,'status',{'status':'running'})
-            async for text in stream_model(self.cfg,messages):
-                async with self.gates[owner].work():
-                    row=self.owned(rid,owner)
-                    if not self.auth.valid(actor) or row['cancel_requested']:
-                        raise asyncio.CancelledError()
-                    with self.db.transaction():
-                        self.db.run('UPDATE messages SET content=content||?,updated_at=? WHERE id=?',(text,now(),row['assistant_message_id']))
-                        self.db.event(rid,'delta',{'append':text,'claim_index':None,'claim':None})
+            initial=self.owned(rid,owner)
+            async with aclosing(self.output(initial,messages)) as output:
+                async for text in output:
+                    async with self.gates[owner].work():
+                        row=self.owned(rid,owner)
+                        if not self.auth.valid(actor) or row['cancel_requested'] or not self.dependencies_valid(row):
+                            raise asyncio.CancelledError()
+                        with self.db.transaction():
+                            if row['mode']=='document':
+                                persist_claim(self.db,row,*text)
+                            else:
+                                self.db.run('UPDATE messages SET content=content||?,updated_at=? WHERE id=?',(text,now(),row['assistant_message_id']))
+                                self.db.event(rid,'delta',{'append':text,'claim_index':None,'claim':None})
             async with self.gates[owner].work():
                 if not self.auth.valid(actor):
                     self.finish(rid,'interrupted',model_error('PROCESS_INTERRUPTED'))
